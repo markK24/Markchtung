@@ -1,4 +1,6 @@
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
@@ -10,7 +12,9 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
@@ -21,9 +25,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.browser.window
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import markchtung.composeapp.generated.resources.PoetsenOne_Regular
 import markchtung.composeapp.generated.resources.Res
 import org.jetbrains.compose.resources.Font
+import kotlin.math.PI
+import kotlin.random.Random
 
 val KEYMAP = arrayOf(
     "", // [0]
@@ -319,7 +329,10 @@ fun App() {
                 startGame = { inGame = true }
             )
         } else {
-//            MainMenu(onStartGame = { inGame = true })
+            Game(
+                players = players,
+                keys = keys,
+                exitGame = { inGame = false })
         }
     }
 }
@@ -388,7 +401,8 @@ fun ChoosePlayers(
                         onEvent = { strikethrough = false }
                     ).clickable(enabled = players.size > 2, onClickLabel = "Remove player", role = Role.Button) {
                         if (editing == name) editing = null
-                        removePlayer(name) },
+                        removePlayer(name)
+                    },
                     textAlign = TextAlign.Center,
                     text = name,
                     color = color,
@@ -449,5 +463,141 @@ fun ChoosePlayers(
                 fontFamily = poetsenOneFont,
             )
         }
+    }
+}
+
+
+const val TURN_AMOUNT = 0.1
+const val SPEED_CONSTANT = 1
+
+@Composable
+fun Game(players: List<String>, keys: Map<Key, Pair<String, Boolean>>, exitGame: () -> Unit) {
+
+    val poetsenOneFont = FontFamily(
+        Font(Res.font.PoetsenOne_Regular)
+    )
+
+    val scores = remember { mutableStateMapOf<String, Int>() }
+    val speeds = remember { mutableStateMapOf<String, Double>() }
+    val headings = remember { mutableStateMapOf<String, Double>() }
+    val locations = remember { mutableStateMapOf<String, Pair<Double, Double>>() }
+
+    var paused by remember { mutableStateOf(true) }
+    var lastTime: ULong by remember { mutableStateOf(0U) }
+
+    val focusRequester = remember { FocusRequester() }
+
+    val lines =
+        remember { mutableStateListOf<Pair<Color, Pair<Pair<Double, Double>, Pair<Double, Double>>>>() }
+
+    LaunchedEffect(true) {
+        withContext(Dispatchers.Default) {
+//            println("Launched")
+            if (scores.keys.size != players.size) {
+                players.forEach { scores[it] = 0 }
+            }
+
+            if (speeds.keys.size != players.size) {
+                players.forEach { speeds[it] = 1.0 }
+            }
+
+            if (headings.keys.size != players.size) {
+                players.forEach { headings[it] = Random.nextDouble(0.0, 2 * PI) }
+            }
+
+            if (locations.keys.size != players.size) {
+                players.forEach { locations[it] = Random.nextDouble(50.0, 450.0) to Random.nextDouble(50.0, 450.0) }
+            }
+
+            focusRequester.requestFocus()
+            focusRequester.captureFocus()
+
+            while (true) {
+                val time = window.performance.now().toULong()
+                val dticks = (time / 20U - lastTime / 20U)
+                lastTime = time
+
+                if (paused) {
+                    delay(100)
+                    continue
+                }
+
+
+//                println("dticks: $dticks")
+                players.forEach { player ->
+                    val (x, y) = locations[player] ?: return@forEach
+                    val speed = speeds[player] ?: return@forEach
+                    val heading = headings[player] ?: return@forEach
+
+                    val dx = speed * SPEED_CONSTANT * dticks.toDouble() * kotlin.math.cos(heading)
+                    val dy = speed * SPEED_CONSTANT * dticks.toDouble() * kotlin.math.sin(heading)
+
+                    locations[player] = x + dx to y + dy
+
+                    lines += PLAYERS.getValue(player) to ((x to y) to (x + dx to y + dy))
+
+                    // TODO: collision detection
+                }
+
+                delay(20)
+            }
+        }
+    }
+
+    Row(modifier = Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+        Box(modifier = Modifier.weight(2f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+            Canvas(
+                modifier = Modifier.focusRequester(focusRequester).focusable().onPreviewKeyEvent {
+//                        println("key event")
+                        if (it.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+
+                        when (it.key) {
+                            Key.Spacebar -> paused = !paused
+                            Key.Escape -> if (paused) {
+                                focusRequester.freeFocus()
+                                exitGame()
+                            }
+                            in keys.keys -> {
+                                val (player, left) = keys.getValue(it.key)
+//                                val speed = speeds[player] ?: return@onKeyEvent false
+                                val heading = headings[player] ?: return@onPreviewKeyEvent false
+
+                                if (left) {
+//                                    speeds[player] = speed / 2
+                                    headings[player] = headings[player]!! + TURN_AMOUNT
+                                    headings[player] = headings[player]!! % (2 * PI)
+                                } else {
+//                                    speeds[player] = speed * 2
+                                    headings[player] = headings[player]!! - TURN_AMOUNT
+                                    headings[player] = headings[player]!! % (2 * PI)
+                                }
+                            }
+                            else -> return@onPreviewKeyEvent false
+                        }
+
+                        return@onPreviewKeyEvent true
+                    }.fillMaxSize(0.75f).aspectRatio(1f).border(5.dp, Color.White)) {
+//                println("Drawing")
+                scale(scaleX = size.width / 500, scaleY = size.height / 500, pivot = Offset(0f, 0f)) {
+//                    println("${lines.size} lines")
+                    lines.forEach { (color, line) ->
+                        val (start, end) = line
+                        drawLine(
+                            color,
+                            start = Offset(start.first.toFloat(), start.second.toFloat()),
+                            end = Offset(end.first.toFloat(), end.second.toFloat()),
+                            strokeWidth = 8f
+                        )
+                    }
+
+                    players.forEach { player ->
+                        val (x, y) = locations[player] ?: return@forEach
+                        val color = PLAYERS.getValue(player)
+                        drawCircle(color, center = Offset(x.toFloat(), y.toFloat()), radius = 6f)
+                    }
+                }
+            }
+        }
+        Column(modifier = Modifier.weight(1f).fillMaxHeight()) {  }
     }
 }
