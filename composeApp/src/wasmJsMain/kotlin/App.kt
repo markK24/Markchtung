@@ -1,4 +1,3 @@
-
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -7,6 +6,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.Surface
 import androidx.compose.material.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
@@ -14,7 +14,11 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.vector.PathNode
+import androidx.compose.ui.graphics.vector.toPath
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
@@ -33,6 +37,9 @@ import markchtung.composeapp.generated.resources.PoetsenOne_Regular
 import markchtung.composeapp.generated.resources.Res
 import org.jetbrains.compose.resources.Font
 import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.random.Random
 
 val KEYMAP = arrayOf(
@@ -294,8 +301,6 @@ val KEYMAP = arrayOf(
     "", // [255]
 )
 
-val MAX_PLAYERS = 6
-
 @Suppress("SpellCheckingInspection")
 val PLAYERS = mapOf(
     "Goldy" to Color(0xFFDAA520), // Gold
@@ -305,6 +310,8 @@ val PLAYERS = mapOf(
     "Bloody" to Color(0xFF660000), // Blood-red
     "Manghoost" to Color(0xFFF8F8FF), // Ghost white
 )
+
+val MAX_PLAYERS = PLAYERS.size
 
 @Composable
 fun App() {
@@ -325,7 +332,10 @@ fun App() {
                     }
                 },
                 removePlayer = { players.remove(it) },
-                bindKey = { key, left, player -> keys[key] = player to left },
+                bindKey = { key, left, player ->
+                    keys.filterValues { it.first == player && it.second == left }.keys.forEach { keys.remove(it) }
+                    keys[key] = player to left
+                },
                 startGame = { inGame = true }
             )
         } else {
@@ -467,12 +477,35 @@ fun ChoosePlayers(
 }
 
 
-const val TURN_AMOUNT = 0.1
-const val SPEED_CONSTANT = 1
+//fun calculateRectangle(startLocation: Pair<Double, Double>, endLocation: Pair<Double, Double>, radians: Double): Rect {
+//    val (x1, y1) = startLocation
+//    val (x2, y2) = endLocation
+//
+//    val h = sqrt((x2 - x1).pow(2) + (y2 - y1).pow(2))
+//
+//    val r = (h / 2) / sin(radians / 2)
+//
+//    val xA = (x2 - x1) / 2
+//    val yA = (y2 - y1) / 2
+//
+//    val x0 = (x1 + xA)
+//    val y0 = (y1 + yA)
+//
+//    val o = if (radians > 0) {
+//        Offset((x0 + (1 / tan(radians / 2)) * yA).toFloat(), (y0 - (1 / tan(radians / 2)) * xA).toFloat())
+//    } else {
+//        Offset((x0 - (1 / tan(radians / 2)) * yA).toFloat(), (y0 + (1 / tan(radians / 2)) * xA).toFloat())
+//    }
+//
+//    return Rect(center = o, radius = r.toFloat())
+//}
+
+
+const val MOVE_PER_TICK = 1.25
+const val TURN_PER_TICK = 0.04 // radians
 
 @Composable
 fun Game(players: List<String>, keys: Map<Key, Pair<String, Boolean>>, exitGame: () -> Unit) {
-
     val poetsenOneFont = FontFamily(
         Font(Res.font.PoetsenOne_Regular)
     )
@@ -482,17 +515,27 @@ fun Game(players: List<String>, keys: Map<Key, Pair<String, Boolean>>, exitGame:
     val headings = remember { mutableStateMapOf<String, Double>() }
     val locations = remember { mutableStateMapOf<String, Pair<Double, Double>>() }
 
+    val manoeuvreStart = remember { mutableStateMapOf<String, Pair<Double, Double>>() }
+    val headingStart = remember { mutableStateMapOf<String, Double>() }
+    val turning = remember { mutableStateMapOf<String, Int>() }
+    val fullCircle = remember { mutableStateMapOf<String, Boolean>() }
+//    val distanceTicks = remember { mutableStateMapOf<String, Double>() }
+//    val turnTicks = remember { mutableStateMapOf<String, Double>() }
+    val manoeuvreTicks = remember { mutableStateMapOf<String, Double>() }
+
+    val pathStack = remember { mutableStateListOf<Pair<Color, Path>>() }
+//    val manoeuvreStack = remember { mutableStateMapOf<String, Path>() }
+//    val lastManoeuvre = remember { mutableStateMapOf<String, Path>() }
+    val manoeuvre = remember { mutableMapOf<String, SnapshotStateList<PathNode>>() }
+
     var paused by remember { mutableStateOf(true) }
     var lastTime: ULong by remember { mutableStateOf(0U) }
 
     val focusRequester = remember { FocusRequester() }
 
-    val lines =
-        remember { mutableStateListOf<Pair<Color, Pair<Pair<Double, Double>, Pair<Double, Double>>>>() }
-
     LaunchedEffect(true) {
         withContext(Dispatchers.Default) {
-//            println("Launched")
+            // Initialize state
             if (scores.keys.size != players.size) {
                 players.forEach { scores[it] = 0 }
             }
@@ -509,9 +552,53 @@ fun Game(players: List<String>, keys: Map<Key, Pair<String, Boolean>>, exitGame:
                 players.forEach { locations[it] = Random.nextDouble(50.0, 450.0) to Random.nextDouble(50.0, 450.0) }
             }
 
+            if (manoeuvreStart.keys.size != players.size) {
+                players.forEach { manoeuvreStart[it] = locations[it]!! }
+            }
+
+            if (headingStart.keys.size != players.size) {
+                players.forEach { headingStart[it] = headings[it]!! }
+            }
+
+            if (turning.keys.size != players.size) {
+                players.forEach { turning[it] = 0 }
+            }
+
+            if (fullCircle.keys.size != players.size) {
+                players.forEach { fullCircle[it] = false }
+            }
+
+//            if (distanceTicks.keys.size != players.size) {
+//                players.forEach { distanceTicks[it] = 0.0 }
+//            }
+//
+//            if (turnTicks.keys.size != players.size) {
+//                players.forEach { turnTicks[it] = 0.0 }
+//            }
+
+            if (manoeuvreTicks.keys.size != players.size) {
+                players.forEach { manoeuvreTicks[it] = 0.0 }
+            }
+
+//            players.forEach { player ->
+//                manoeuvreStack[player] = Path().apply {
+//                    moveTo(locations[player]!!.first.toFloat(), locations[player]!!.second.toFloat())
+//                }
+//                lastManoeuvre[player] = manoeuvreStack[player]!!
+//            }
+
+            players.forEach { player ->
+                manoeuvre[player] = mutableStateListOf(
+                    PathNode.MoveTo(locations[player]!!.first.toFloat(), locations[player]!!.second.toFloat()),
+                    PathNode.LineTo(locations[player]!!.first.toFloat(), locations[player]!!.second.toFloat()),
+                )
+            }
+
             focusRequester.requestFocus()
             focusRequester.captureFocus()
 
+
+            // Game loop
             while (true) {
                 val time = window.performance.now().toULong()
                 val dticks = (time / 20U - lastTime / 20U)
@@ -523,18 +610,143 @@ fun Game(players: List<String>, keys: Map<Key, Pair<String, Boolean>>, exitGame:
                 }
 
 
-//                println("dticks: $dticks")
                 players.forEach { player ->
-                    val (x, y) = locations[player] ?: return@forEach
-                    val speed = speeds[player] ?: return@forEach
-                    val heading = headings[player] ?: return@forEach
+//                    distanceTicks[player] = distanceTicks[player]!! + dticks.toDouble() * speeds[player]!!
+//                    turnTicks[player] = turnTicks[player]!! + dticks.toDouble()
+                    manoeuvreTicks[player] = manoeuvreTicks[player]!! + dticks.toDouble() * speeds[player]!!
 
-                    val dx = speed * SPEED_CONSTANT * dticks.toDouble() * kotlin.math.cos(heading)
-                    val dy = speed * SPEED_CONSTANT * dticks.toDouble() * kotlin.math.sin(heading)
+                    val turn = turning[player]!!
 
-                    locations[player] = x + dx to y + dy
+                    if (turn == 0) {
+                        val x =
+                            manoeuvreStart[player]!!.first + cos(headings[player]!!) * MOVE_PER_TICK * manoeuvreTicks[player]!!
+                        val y =
+                            manoeuvreStart[player]!!.second + sin(headings[player]!!) * MOVE_PER_TICK * manoeuvreTicks[player]!!
 
-                    lines += PLAYERS.getValue(player) to ((x to y) to (x + dx to y + dy))
+                        locations[player] = x to y
+
+                        manoeuvre[player]!!.removeLast()
+                        manoeuvre[player]!!.add(PathNode.LineTo(x.toFloat(), y.toFloat()))
+                    } else {
+//                        val angle = TURN_PER_TICK * turnTicks[player]!! * turn
+//
+//                        headings[player] = headingStart[player]!! + angle
+//
+//                        val radius = (MOVE_PER_TICK * distanceTicks[player]!!) / abs(angle)
+//
+//                        val angleTowardsCenter = headingStart[player]!! + turn * PI / 2
+//
+//                        val cX = manoeuvreStart[player]!!.first + cos(angleTowardsCenter) * radius
+//                        val cY = manoeuvreStart[player]!!.second + sin(angleTowardsCenter) * radius
+//
+//                        val x = cX + cos(headings[player]!!) * radius
+//                        val y = cY + sin(headings[player]!!) * radius
+//
+//                        locations[player] = x to y
+//
+//                        lastManoeuvre[player] = Path().apply {
+//                            addPath(manoeuvreStack[player]!!)
+//                            arcToRad(
+//                                rect = Rect(center = Offset(cX.toFloat(), cY.toFloat()), radius = radius.toFloat()),
+//                                startAngleRadians = -headingStart[player]!!.toFloat(),
+//                                sweepAngleRadians = -angle.toFloat(),
+//                                forceMoveTo = false
+//                            )
+//                        }
+
+                        val radius =
+                            (MOVE_PER_TICK / TURN_PER_TICK) * speeds[player]!! // If speed changes, start a new manoeuvre!!!
+
+                        val angle = manoeuvreTicks[player]!! * TURN_PER_TICK / (speeds[player]!!) * turn
+
+                        val aOld = headingStart[player]!! + turn * PI / 2
+                        val aNew = aOld + angle
+
+                        val (x, y) = manoeuvreStart[player]!!
+                        val cX = x + cos(aOld) * radius
+                        val cY = y + sin(aOld) * radius
+                        val x1 = cX - cos(aNew) * radius
+                        val y1 = cY - sin(aNew) * radius
+
+                        locations[player] = x1 to y1
+
+                        headings[player] = headingStart[player]!! + angle
+
+                        manoeuvre[player]!!.removeLast()
+
+                        if (abs(angle) > PI * 2 && !fullCircle[player]!!) {
+                            manoeuvre[player]!!.addAll(
+                                listOf(
+                                    PathNode.ArcTo(
+                                        horizontalEllipseRadius = radius.toFloat(),
+                                        verticalEllipseRadius = radius.toFloat(),
+                                        theta = 0f,
+                                        isPositiveArc = turn > 0,
+                                        isMoreThanHalf = false,
+                                        arcStartX = (x + 2 * cos(aOld) * radius).toFloat(),
+                                        arcStartY = (y + 2 * sin(aOld) * radius).toFloat()
+                                    ),
+                                    PathNode.ArcTo(
+                                        horizontalEllipseRadius = radius.toFloat(),
+                                        verticalEllipseRadius = radius.toFloat(),
+                                        theta = 0f,
+                                        isPositiveArc = turn > 0,
+                                        isMoreThanHalf = false,
+                                        arcStartX = x.toFloat(),
+                                        arcStartY = y.toFloat()
+                                    ),
+                                )
+                            )
+                            fullCircle[player] = true
+                        }
+
+                        manoeuvre[player]!!.add(
+                            PathNode.ArcTo(
+                                horizontalEllipseRadius = radius.toFloat(),
+                                verticalEllipseRadius = radius.toFloat(),
+                                theta = 0f,
+                                isPositiveArc = turn > 0,
+                                isMoreThanHalf = abs(angle % (2 * PI)) > PI,
+                                arcStartX = x1.toFloat(),
+                                arcStartY = y1.toFloat()
+                            )
+                        )
+
+//                        println("player: $player, turn: $turn, angle: $angle, radius: $radius, center: ($cX, $cY), loc: ($x, $y)")
+//                        println(
+//                            """
+//                            player: $player,
+//                            turn: $turn,
+//                            turnTicks: ${turnTicks[player]},
+//                            moveTicks: ${distanceTicks[player]},
+//                            angle: $angle,
+//                            startHeading: ${headingStart[player]},
+//                            newHeading: ${headings[player]},
+//                            radius: $radius,
+//                            angleTowardsCenter: $angleTowardsCenter,
+//                            center: ($cX, $cY),
+//                            start: ${manoeuvreStart[player]},
+//                            newLoc: ($x, $y)
+//
+//                            Path: ${lastManoeuvre[player]?.asSkiaPath()?.dump()}
+//                        """.trimIndent()
+//                        )
+
+//                        println("""
+//                            player: $player,
+//
+//                            turn: $turn,
+//                            angle: $angle,
+//                            radius: $radius,
+//
+//                            startHeading: ${headingStart[player]},
+//                            newHeading: ${headings[player]},
+//
+//                            start: ($x, $y),
+//                            center: ($cX, $cY),
+//                            newLoc: ($x1, $y1)
+//                        """.trimIndent())
+                    }
 
                     // TODO: collision detection
                 }
@@ -548,56 +760,84 @@ fun Game(players: List<String>, keys: Map<Key, Pair<String, Boolean>>, exitGame:
         Box(modifier = Modifier.weight(2f).fillMaxHeight(), contentAlignment = Alignment.Center) {
             Canvas(
                 modifier = Modifier.focusRequester(focusRequester).focusable().onPreviewKeyEvent {
-//                        println("key event")
-                        if (it.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when {
+                        it.key in keys.keys -> {
+                            val (player, left) = keys.getValue(it.key)
 
-                        when (it.key) {
-                            Key.Spacebar -> paused = !paused
-                            Key.Escape -> if (paused) {
-                                focusRequester.freeFocus()
-                                exitGame()
-                            }
-                            in keys.keys -> {
-                                val (player, left) = keys.getValue(it.key)
-//                                val speed = speeds[player] ?: return@onKeyEvent false
-                                val heading = headings[player] ?: return@onPreviewKeyEvent false
-
-                                if (left) {
-//                                    speeds[player] = speed / 2
-                                    headings[player] = headings[player]!! + TURN_AMOUNT
-                                    headings[player] = headings[player]!! % (2 * PI)
-                                } else {
-//                                    speeds[player] = speed * 2
-                                    headings[player] = headings[player]!! - TURN_AMOUNT
-                                    headings[player] = headings[player]!! % (2 * PI)
+//                            println("Key event: $player, type: $it.type, left: $left, location: ${locations[player]}")
+                            if (it.type == KeyEventType.KeyDown && !paused && turning[player] != if (left) 1 else -1) {
+                                turning[player] = if (left) 1 else -1
+                            } else if (it.type == KeyEventType.KeyUp) {
+                                turning[player] = when {
+                                    turning[player] == 1 && left -> 0
+                                    turning[player] == -1 && !left -> 0
+                                    else -> return@onPreviewKeyEvent true
                                 }
+                            } else {
+                                return@onPreviewKeyEvent false
                             }
-                            else -> return@onPreviewKeyEvent false
+
+//                            manoeuvreStack[player] = lastManoeuvre[player]!!
+                            manoeuvre[player]?.add(
+                                PathNode.LineTo(
+                                    locations[player]!!.first.toFloat(),
+                                    locations[player]!!.second.toFloat()
+                                )
+                            )
+                            fullCircle[player] = false
+
+                            headingStart[player] = headings[player]!!
+                            manoeuvreStart[player] = locations[player]!!
+//                            distanceTicks[player] = 0.0
+//                            turnTicks[player] = 0.0
+                            manoeuvreTicks[player] = 0.0
+
+                            true
                         }
 
-                        return@onPreviewKeyEvent true
-                    }.fillMaxSize(0.75f).aspectRatio(1f).border(5.dp, Color.White)) {
+                        it.type != KeyEventType.KeyDown -> false
+                        it.key == Key.Spacebar -> {
+                            paused = !paused
+                            true
+                        }
+
+                        it.key == Key.Escape && paused -> {
+                            exitGame()
+                            true
+                        }
+
+                        else -> false
+                    }
+                }.fillMaxSize(0.75f).aspectRatio(1f).border(5.dp, Color.White)
+            ) {
 //                println("Drawing")
-                scale(scaleX = size.width / 500, scaleY = size.height / 500, pivot = Offset(0f, 0f)) {
-//                    println("${lines.size} lines")
-                    lines.forEach { (color, line) ->
-                        val (start, end) = line
-                        drawLine(
-                            color,
-                            start = Offset(start.first.toFloat(), start.second.toFloat()),
-                            end = Offset(end.first.toFloat(), end.second.toFloat()),
-                            strokeWidth = 8f
-                        )
+                withTransform({
+                    scale(scaleX = 1f, scaleY = -1f)
+                    scale(
+                        scaleX = size.width / 500,
+                        scaleY = size.height / 500,
+                        pivot = Offset(0f, 0f)
+                    )
+                }) {
+//                      println("${lines.size} lines")
+                    pathStack.forEach { (color, path) ->
+                        drawPath(path, color, style = Stroke(width = 8f))
                     }
 
                     players.forEach { player ->
+                        drawPath(
+                            manoeuvre[player]?.toPath() ?: return@forEach,
+                            PLAYERS.getValue(player),
+                            style = Stroke(width = 8f)
+                        )
+
                         val (x, y) = locations[player] ?: return@forEach
                         val color = PLAYERS.getValue(player)
-                        drawCircle(color, center = Offset(x.toFloat(), y.toFloat()), radius = 6f)
+                        drawCircle(color, center = Offset(x.toFloat(), y.toFloat()), radius = 5f)
                     }
                 }
             }
         }
-        Column(modifier = Modifier.weight(1f).fillMaxHeight()) {  }
+        Column(modifier = Modifier.weight(1f).fillMaxHeight()) { }
     }
 }
